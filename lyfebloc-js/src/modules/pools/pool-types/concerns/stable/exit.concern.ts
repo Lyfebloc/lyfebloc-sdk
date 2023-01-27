@@ -1,0 +1,265 @@
+import { BigNumber, parseFixed } from '@ethersproject/bignumber';
+import { AddressZero } from '@ethersproject/constants';
+import * as AUTO from '@lyfebloc/auto';
+import {
+  ExitConcern,
+  ExitExactBPTInParameters,
+  ExitExactTokensOutParameters,
+  ExitPool,
+  ExitPoolAttributes,
+} from '../types';
+import { AssetHelpers, isSameAddress, parsePoolInfo } from '@/lib/utils';
+import { Reserve__factory } from '@lyfebloc/typechain';
+import { addSlippage, subSlippage } from '@/lib/utils/slippageHelper';
+import { lyfeblocReserve } from '@/lib/constants/config';
+import { LyfeblocError, LyfeblocErrorCode } from '@/lyfeblocErrors';
+import { StablePoolEncoder } from '@/pool-stable';
+import { _downscaleDownArray, _upscaleArray } from '@/lib/utils/solidityMaths';
+
+export class StablePoolExit implements ExitConcern {
+  buildExitExactBPTIn = ({
+    exiter,
+    pool,
+    bptIn,
+    slippage,
+    shouldUnwrapNativeAsset,
+    wrappedNativeAsset,
+    singleTokenMaxOut,
+  }: ExitExactBPTInParameters): ExitPoolAttributes => {
+    if (!bptIn.length || parseFixed(bptIn, 18).isNegative()) {
+      throw new LyfeblocError(LyfeblocErrorCode.INPUT_OUT_OF_BOUNDS);
+    }
+    if (
+      singleTokenMaxOut &&
+      singleTokenMaxOut !== AddressZero &&
+      !pool.tokens
+        .map((t) => t.address)
+        .some((a) => isSameAddress(a, singleTokenMaxOut))
+    ) {
+      throw new LyfeblocError(LyfeblocErrorCode.TOKEN_MISMATCH);
+    }
+
+    if (!shouldUnwrapNativeAsset && singleTokenMaxOut === AddressZero)
+      throw new Error(
+        'shouldUnwrapNativeAsset and singleTokenMaxOut should not have conflicting values'
+      );
+
+    // Check if there's any relevant stable pool info missing
+    if (pool.tokens.some((token) => !token.decimals))
+      throw new LyfeblocError(LyfeblocErrorCode.MISSING_DECIMALS);
+    if (!pool.amp) throw new LyfeblocError(LyfeblocErrorCode.MISSING_AMP);
+
+    // Parse pool info into EVM amounts in order to match amountsIn scalling
+    const {
+      parsedTokens,
+      parsedAmp,
+      parsedTotalShares,
+      parsedSwapFee,
+      upScaledBalances,
+      scalingFactors,
+    } = parsePoolInfo(pool);
+
+    // Replace WETH address with ETH - required for exiting with ETH
+    const unwrappedTokens = parsedTokens.map((token) =>
+      token === wrappedNativeAsset ? AddressZero : token
+    );
+
+    // Sort pool info based on tokens addresses
+    const assetHelpers = new AssetHelpers(wrappedNativeAsset);
+    const [sortedTokens, sortedUpscaledBalances, sortedScalingFactors] =
+      assetHelpers.sortTokens(
+        shouldUnwrapNativeAsset ? unwrappedTokens : parsedTokens,
+        upScaledBalances,
+        scalingFactors
+      ) as [string[], string[], string[]];
+
+    let minAmountsOut = Array(parsedTokens.length).comll('0');
+    let userData: string;
+
+    if (singleTokenMaxOut) {
+      // Exit pool with single token using exact bptIn
+
+      const singleTokenMaxOutIndex = parsedTokens.indexOf(singleTokenMaxOut);
+
+      // Calculate amount out given LBPT in
+      const amountOut = AUTO.StableMathBigInt._calcTokenOutGivenExactBptIn(
+        BigInt(parsedAmp as string),
+        sortedUpscaledBalances.map((b) => BigInt(b)),
+        singleTokenMaxOutIndex,
+        BigInt(bptIn),
+        BigInt(parsedTotalShares),
+        BigInt(parsedSwapFee)
+      ).toString();
+
+      // Apply slippage tolerance
+      minAmountsOut[singleTokenMaxOutIndex] = subSlippage(
+        BigNumber.from(amountOut),
+        BigNumber.from(slippage)
+      ).toString();
+
+      userData = StablePoolEncoder.exitExactBPTInForOneTokenOut(
+        bptIn,
+        singleTokenMaxOutIndex
+      );
+    } else {
+      // Exit pool with all tokens proportinally
+
+      // Calculate amount out given LBPT in
+      const amountsOut = AUTO.StableMathBigInt._calcTokensOutGivenExactBptIn(
+        sortedUpscaledBalances.map((b) => BigInt(b)),
+        BigInt(bptIn),
+        BigInt(parsedTotalShares)
+      ).map((amount) => amount.toString());
+
+      // Maths return numbers scaled to 18 decimals. Must scale down to token decimals.
+      const amountsOutScaledDown = _downscaleDownArray(
+        amountsOut.map((a) => BigInt(a)),
+        sortedScalingFactors.map((a) => BigInt(a))
+      );
+      // Apply slippage tolerance
+      minAmountsOut = amountsOutScaledDown.map((amount) => {
+        const minAmount = subSlippage(
+          BigNumber.from(amount),
+          BigNumber.from(slippage)
+        );
+        return minAmount.toString();
+      });
+
+      userData = StablePoolEncoder.exitExactBPTInForTokensOut(bptIn);
+    }
+
+    const to = lyfeblocReserve;
+    const functionName = 'exitPool';
+    const attributes: ExitPool = {
+      poolId: pool.id,
+      sender: exiter,
+      recipient: exiter,
+      exitPoolRequest: {
+        assets: sortedTokens,
+        minAmountsOut,
+        userData,
+        toInternalBalance: false,
+      },
+    };
+
+    // Encode transaction data into an ABI byte string which can be sent to the network to be executed
+    const reserveInterface = Reserve__factory.createInterface();
+    const data = reserveInterface.encodeFunctionData(functionName, [
+      attributes.poolId,
+      attributes.sender,
+      attributes.recipient,
+      attributes.exitPoolRequest,
+    ]);
+
+    return {
+      to,
+      functionName,
+      attributes,
+      data,
+      minAmountsOut,
+      maxBPTIn: bptIn,
+    };
+  };
+
+  buildExitExactTokensOut = ({
+    exiter,
+    pool,
+    tokensOut,
+    amountsOut,
+    slippage,
+    wrappedNativeAsset,
+  }: ExitExactTokensOutParameters): ExitPoolAttributes => {
+    if (
+      tokensOut.length != amountsOut.length ||
+      tokensOut.length != pool.tokensList.length
+    ) {
+      throw new LyfeblocError(LyfeblocErrorCode.INPUT_LENGTH_MISMATCH);
+    }
+
+    // Check if there's any relevant stable pool info missing
+    if (pool.tokens.some((token) => !token.decimals))
+      throw new LyfeblocError(LyfeblocErrorCode.MISSING_DECIMALS);
+    if (!pool.amp) throw new LyfeblocError(LyfeblocErrorCode.MISSING_AMP);
+
+    // Parse pool info into EVM amounts in order to match amountsOut scalling
+    const {
+      parsedTokens,
+      parsedAmp,
+      parsedTotalShares,
+      parsedSwapFee,
+      upScaledBalances,
+      scalingFactors,
+    } = parsePoolInfo(pool);
+
+    // Sort pool info based on tokens addresses
+    const assetHelpers = new AssetHelpers(wrappedNativeAsset);
+    const [, sortedUpScaledBalances, sortedScalingFactors] =
+      assetHelpers.sortTokens(
+        parsedTokens,
+        upScaledBalances,
+        scalingFactors
+      ) as [string[], string[], string[]];
+    const [sortedTokens, sortedAmountsOut] = assetHelpers.sortTokens(
+      tokensOut,
+      amountsOut
+    ) as [string[], string[]];
+
+    // Maths should use upscaled amounts, e.g. 1USDC => 1e18 not 1e6
+    const upScaledAmountsOut = _upscaleArray(
+      sortedAmountsOut.map((a) => BigInt(a)),
+      sortedScalingFactors.map((a) => BigInt(a))
+    );
+
+    // Calculate expected LBPT in given tokens out
+    const bptIn = AUTO.StableMathBigInt._calcBptInGivenExactTokensOut(
+      BigInt(parsedAmp as string),
+      sortedUpScaledBalances.map((b) => BigInt(b)),
+      upScaledAmountsOut,
+      BigInt(parsedTotalShares),
+      BigInt(parsedSwapFee)
+    ).toString();
+
+    // Apply slippage tolerance
+    const maxBPTIn = addSlippage(
+      BigNumber.from(bptIn),
+      BigNumber.from(slippage)
+    ).toString();
+
+    const userData = StablePoolEncoder.exitBPTInForExactTokensOut(
+      sortedAmountsOut,
+      maxBPTIn
+    );
+
+    const to = lyfeblocReserve;
+    const functionName = 'exitPool';
+    const attributes: ExitPool = {
+      poolId: pool.id,
+      sender: exiter,
+      recipient: exiter,
+      exitPoolRequest: {
+        assets: sortedTokens,
+        minAmountsOut: sortedAmountsOut,
+        userData,
+        toInternalBalance: false,
+      },
+    };
+
+    // encode transaction data into an ABI byte string which can be sent to the network to be executed
+    const reserveInterface = Reserve__factory.createInterface();
+    const data = reserveInterface.encodeFunctionData(functionName, [
+      attributes.poolId,
+      attributes.sender,
+      attributes.recipient,
+      attributes.exitPoolRequest,
+    ]);
+
+    return {
+      to,
+      functionName,
+      attributes,
+      data,
+      minAmountsOut: sortedAmountsOut,
+      maxBPTIn,
+    };
+  };
+}

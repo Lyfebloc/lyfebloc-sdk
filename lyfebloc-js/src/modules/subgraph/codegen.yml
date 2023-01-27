@@ -1,0 +1,37 @@
+overwrite: true
+generates:
+    src/modules/subgraph/generated/lyfebloc-subgraph-types.ts:
+        schema: ${LYFEBLOC_SUBGRAPH_URL:https://api.thegraph.com/subgraphs/name/uniswap/uniswap-v2}
+        documents: 'src/modules/subgraph/lyfebloc-v2/**/*.graphql'
+        plugins:
+            - typescript
+            - typescript-operations
+            - typescript-graphql-request
+        config:
+            scalars:
+                BigInt: string
+                Bytes: string
+                BigDecimal: string
+    src/modules/subgraph/generated/lyfebloc-subgraph-schema.graphql:
+        schema: ${LYFEBLOC_SUBGRAPH_URL:https://api.thegraph.com/subgraphs/name/uniswap/uniswap-v2}
+        plugins:
+            - schema-ast
+    src/modules/subgraph/generated/lyfebloc-gauges.ts:
+        schema: ${LYFEBLOC_GAUGES_URL:https://api.thegraph.com/subgraphs/name/samster91/idle-tranches}
+        documents: 'src/modules/subgraph/lyfebloc-gauges/**/*.graphql'
+        plugins:
+            - typescript
+            - typescript-operations
+            - typescript-graphql-request
+        config:
+            scalars:
+                BigInt: string
+                Bytes: string
+                BigDecimal: string
+    src/modules/subgraph/generated/lyfebloc-gauges.graphql:
+        schema: ${LYFEBLOC_GAUGES_URL:https://api.thegraph.com/subgraphs/name/samster91/idle-tranches}
+        plugins:
+            - schema-ast
+hooks:
+    afterOneFileWrite:
+        - eslint --fix

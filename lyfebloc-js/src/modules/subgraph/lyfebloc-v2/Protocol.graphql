@@ -1,0 +1,28 @@
+query Lyfeblocs(
+    $skip: Int
+    $first: Int
+    $orderBy: Lyfebloc_orderBy
+    $orderDirection: OrderDirection
+    $where: Lyfebloc_filter
+    $block: Block_height
+) {
+    lyfeblocs(
+        skip: $skip
+        first: $first
+        orderBy: $orderBy
+        orderDirection: $orderDirection
+        where: $where
+        block: $block
+    ) {
+        ...SubgraphLyfebloc
+    }
+}
+
+fragment SubgraphLyfebloc on Lyfebloc {
+    id
+    totalLiquidity
+    totalSwapVolume
+    totalSwapFee
+    totalSwapCount
+    poolCount
+}
