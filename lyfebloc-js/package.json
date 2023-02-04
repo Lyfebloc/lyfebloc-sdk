@@ -6,11 +6,12 @@
   "homepage": "https://github.com/lyfebloc/lyfebloc-sdk#readme",
   "repository": {
     "type": "git",
-    "url": "https://github.com/lyfebloc/lyfebloc-sdk",
+    "url": "https://github.com/lyfebloc/lyfebloc-sdk.git",
     "directory": "lyfebloc-js"
   },
-  "bugs": {
-    "url": "https://github.com/lyfebloc/lyfebloc-sdk/issues"
+  "publishConfig": {
+    "registry": "https://npm.pkg.github.com"
+},
   },
   "main": "dist/index.js",
   "module": "dist/index.esm.js",
